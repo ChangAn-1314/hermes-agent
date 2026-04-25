@@ -271,9 +271,29 @@ def resolve_requested_provider(requested: Optional[str] = None) -> str:
         return requested.strip().lower()
 
     model_cfg = _get_model_config()
-    cfg_provider = model_cfg.get("provider")
-    if isinstance(cfg_provider, str) and cfg_provider.strip():
-        return cfg_provider.strip().lower()
+    cfg_provider = str(model_cfg.get("provider") or "").strip().lower()
+    cfg_model = str(model_cfg.get("default") or "").strip()
+    cfg_base_url = str(model_cfg.get("base_url") or "").strip().rstrip("/")
+
+    # When config points at a generic custom provider, prefer a matching named
+    # custom_providers entry so runtime resolution preserves per-provider api_key,
+    # api_mode, and source instead of collapsing everything to bare "custom".
+    if cfg_provider == "custom" and cfg_base_url:
+        config = load_config()
+        for entry in get_compatible_custom_providers(config) or []:
+            if not isinstance(entry, dict):
+                continue
+            entry_base = str(entry.get("base_url") or "").strip().rstrip("/")
+            entry_model = str(entry.get("model") or "").strip()
+            entry_name = str(entry.get("name") or "").strip()
+            if not entry_name or entry_base != cfg_base_url:
+                continue
+            if cfg_model and entry_model and entry_model != cfg_model:
+                continue
+            return f"custom:{_normalize_custom_provider_name(entry_name)}"
+
+    if cfg_provider:
+        return cfg_provider
 
     # Prefer the persisted config selection over any stale shell/.env
     # provider override so chat uses the endpoint the user last saved.
@@ -476,6 +496,7 @@ def _resolve_named_custom_runtime(
         "base_url": base_url,
         "api_key": api_key or "no-key-required",
         "source": f"custom_provider:{custom_provider.get('name', requested_provider)}",
+        "requested_provider": requested_provider,
     }
     # Propagate the model name so callers can override self.model when the
     # provider name differs from the actual model string the API expects.

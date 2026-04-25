@@ -7325,6 +7325,14 @@ class AIAgent:
 
     def _build_api_kwargs(self, api_messages: list) -> dict:
         """Build the keyword arguments dict for the active API mode."""
+        logger.debug(
+            "Runtime debug snapshot: model=%s provider=%s api_mode=%s base_url=%s reasoning_config=%r",
+            self.model,
+            self.provider,
+            self.api_mode,
+            self.base_url,
+            self.reasoning_config,
+        )
         if self.api_mode == "anthropic_messages":
             _transport = self._get_transport()
             anthropic_messages = self._prepare_anthropic_messages_for_api(api_messages)

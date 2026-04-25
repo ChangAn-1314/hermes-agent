@@ -23,6 +23,8 @@ import time
 from dataclasses import dataclass
 from typing import Any, Optional
 
+from gateway.platforms.helpers import split_short_chat_block, should_split_short_chat_block, compute_short_chat_delay, compute_long_chunk_delay, split_structured_long_message
+
 logger = logging.getLogger("gateway.stream_consumer")
 
 # Sentinel to signal the stream is complete
@@ -108,6 +110,24 @@ class GatewayStreamConsumer:
         self._adapter_requires_finalize: bool = (
             getattr(adapter, "REQUIRES_EDIT_FINALIZE", False) is True
         )
+        _short_chat_delay_base = getattr(adapter, "_short_chat_delay_base", 0.18)
+        self._short_chat_delay_base = float(_short_chat_delay_base) if isinstance(_short_chat_delay_base, (int, float)) else 0.18
+        _short_chat_delay_per_char = getattr(adapter, "_short_chat_delay_per_char", 0.025)
+        self._short_chat_delay_per_char = float(_short_chat_delay_per_char) if isinstance(_short_chat_delay_per_char, (int, float)) else 0.025
+        _short_chat_delay_max = getattr(adapter, "_short_chat_delay_max", 0.9)
+        self._short_chat_delay_max = float(_short_chat_delay_max) if isinstance(_short_chat_delay_max, (int, float)) else 0.9
+        _long_chunk_delay_base = getattr(adapter, "_long_chunk_delay_base", 0.9)
+        self._long_chunk_delay_base = float(_long_chunk_delay_base) if isinstance(_long_chunk_delay_base, (int, float)) else 0.9
+        _long_chunk_delay_per_char = getattr(adapter, "_long_chunk_delay_per_char", 0.008)
+        self._long_chunk_delay_per_char = float(_long_chunk_delay_per_char) if isinstance(_long_chunk_delay_per_char, (int, float)) else 0.008
+        _long_chunk_delay_max = getattr(adapter, "_long_chunk_delay_max", 4.0)
+        self._long_chunk_delay_max = float(_long_chunk_delay_max) if isinstance(_long_chunk_delay_max, (int, float)) else 4.0
+        _delay_jitter = getattr(adapter, "_delay_jitter", 0.0)
+        self._delay_jitter = float(_delay_jitter) if isinstance(_delay_jitter, (int, float)) else 0.0
+        self._split_short_chat_messages = getattr(adapter, "_split_short_chat_messages", False) is True
+        self._split_structured_long_messages = getattr(adapter, "_split_structured_long_messages", False) is True
+        _structured_long_message_max_lines = getattr(adapter, "_structured_long_message_max_lines", 6)
+        self._structured_long_message_max_lines = int(_structured_long_message_max_lines) if isinstance(_structured_long_message_max_lines, int) else 6
 
         # Think-block filter state (mirrors CLI's _stream_delta tag suppression)
         self._in_think_block = False
@@ -314,6 +334,103 @@ class GatewayStreamConsumer:
 
                 current_update_visible = False
                 if should_edit and self._accumulated:
+                    display_text = self._clean_for_display(self._accumulated)
+                    if not got_done and not got_segment_break and commentary_text is None:
+                        display_text += self.cfg.cursor
+
+                    # Chatty short multiline reply: send as separate bubbles.
+                    if (
+                        got_done
+                        and self.adapter is not None
+                        and self._split_short_chat_messages
+                        and should_split_short_chat_block(self._accumulated)
+                    ):
+                        units = split_short_chat_block(self._accumulated)
+                        for idx, unit in enumerate(units):
+                            result = await self.adapter.send(
+                                chat_id=self.chat_id,
+                                content=unit,
+                                metadata=self.metadata,
+                            )
+                            if result.success:
+                                self._already_sent = True
+                                self._final_response_sent = True
+                                self._message_id = result.message_id or self._message_id
+                                self._last_sent_text = unit
+                            if idx < len(units) - 1:
+                                await asyncio.sleep(
+                                    compute_short_chat_delay(
+                                        unit,
+                                        base=self._short_chat_delay_base,
+                                        per_char=self._short_chat_delay_per_char,
+                                        max_delay=self._short_chat_delay_max,
+                                        jitter=self._delay_jitter,
+                                    )
+                                )
+                        self._accumulated = ""
+                        return
+
+                    # Structured long message: split into multiple sends at finish.
+                    if (
+                        got_done
+                        and self._split_structured_long_messages
+                    ):
+                        structured_chunks = split_structured_long_message(
+                            self._accumulated,
+                            max_lines=self._structured_long_message_max_lines,
+                        )
+                        if len(structured_chunks) > 1:
+                            if self._message_id and self._already_sent:
+                                first_chunk = structured_chunks[0]
+                                self._final_response_sent = await self._send_or_edit(first_chunk, finalize=True)
+                                self._last_sent_text = first_chunk
+                                self._message_id = self._message_id
+                                for idx, chunk in enumerate(structured_chunks[1:]):
+                                    result = await self.adapter.send(
+                                        chat_id=self.chat_id,
+                                        content=chunk,
+                                        metadata=self.metadata,
+                                    )
+                                    if result.success:
+                                        self._already_sent = True
+                                        self._final_response_sent = True
+                                        self._message_id = result.message_id or self._message_id
+                                        self._last_sent_text = chunk
+                                    if idx < len(structured_chunks[1:]) - 1:
+                                        await asyncio.sleep(
+                                            compute_long_chunk_delay(
+                                                chunk,
+                                                base=self._long_chunk_delay_base,
+                                                per_char=self._long_chunk_delay_per_char,
+                                                max_delay=self._long_chunk_delay_max,
+                                                jitter=self._delay_jitter,
+                                            )
+                                        )
+                            else:
+                                for idx, chunk in enumerate(structured_chunks):
+                                    result = await self.adapter.send(
+                                        chat_id=self.chat_id,
+                                        content=chunk,
+                                        metadata=self.metadata,
+                                    )
+                                    if result.success:
+                                        self._already_sent = True
+                                        self._final_response_sent = True
+                                        self._message_id = result.message_id or self._message_id
+                                        self._last_sent_text = chunk
+                                    if idx < len(structured_chunks) - 1:
+                                        await asyncio.sleep(
+                                            compute_long_chunk_delay(
+                                                chunk,
+                                                base=self._long_chunk_delay_base,
+                                                per_char=self._long_chunk_delay_per_char,
+                                                max_delay=self._long_chunk_delay_max,
+                                                jitter=self._delay_jitter,
+                                            )
+                                        )
+                            self._accumulated = ""
+                            return
+
                     # Split overflow: if accumulated text exceeds the platform
                     # limit, split into properly sized chunks.
                     if (
@@ -405,6 +522,8 @@ class GatewayStreamConsumer:
                             self._final_response_sent = await self._send_or_edit(
                                 self._accumulated, finalize=True,
                             )
+                            if not self._final_response_sent:
+                                await self._send_fallback_final(self._accumulated)
                         elif not self._already_sent:
                             self._final_response_sent = await self._send_or_edit(self._accumulated)
                     return
@@ -506,7 +625,7 @@ class GatewayStreamConsumer:
             meta = dict(self.metadata) if self.metadata else {}
             result = await self.adapter.send(
                 chat_id=self.chat_id,
-                content=text,
+                content=self._clean_for_display(text),
                 reply_to=reply_to_id,
                 metadata=meta,
             )
@@ -536,9 +655,15 @@ class GatewayStreamConsumer:
             return final_text[len(prefix):].lstrip()
         return final_text
 
-    @staticmethod
-    def _split_text_chunks(text: str, limit: int) -> list[str]:
+    def _split_text_chunks(self, text: str, limit: int) -> list[str]:
         """Split text into reasonably sized chunks for fallback sends."""
+        if self._split_structured_long_messages:
+            structured = split_structured_long_message(
+                text,
+                max_lines=self._structured_long_message_max_lines,
+            )
+            if len(structured) > 1 and all(len(chunk) <= limit for chunk in structured):
+                return structured
         if len(text) <= limit:
             return [text]
         chunks: list[str] = []
@@ -606,7 +731,7 @@ class GatewayStreamConsumer:
         last_message_id: Optional[str] = None
         last_successful_chunk = ""
         sent_any_chunk = False
-        for chunk in chunks:
+        for idx, chunk in enumerate(chunks):
             # Try sending with one retry on flood-control errors.
             result = None
             for attempt in range(2):
@@ -646,6 +771,16 @@ class GatewayStreamConsumer:
             sent_any_chunk = True
             last_successful_chunk = chunk
             last_message_id = result.message_id or last_message_id
+            if idx < len(chunks) - 1:
+                await asyncio.sleep(
+                    compute_long_chunk_delay(
+                        chunk,
+                        base=self._long_chunk_delay_base,
+                        per_char=self._long_chunk_delay_per_char,
+                        max_delay=self._long_chunk_delay_max,
+                        jitter=self._delay_jitter,
+                    )
+                )
 
         self._message_id = last_message_id
         self._already_sent = True

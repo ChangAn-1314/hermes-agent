@@ -351,6 +351,9 @@ def _resolve_runtime_agent_kwargs() -> dict:
         "command": runtime.get("command"),
         "args": list(runtime.get("args") or []),
         "credential_pool": runtime.get("credential_pool"),
+        "source": runtime.get("source"),
+        "model": runtime.get("model"),
+        "requested_provider": runtime.get("requested_provider"),
     }
 
 
@@ -624,6 +627,19 @@ class GatewayRunner:
     Manages the lifecycle of all platform adapters and routes
     messages to/from the agent.
     """
+
+    @staticmethod
+    def _agent_runtime_kwargs(runtime_kwargs: dict) -> dict:
+        """Return only AIAgent-supported runtime kwargs."""
+        return {
+            "api_key": runtime_kwargs.get("api_key"),
+            "base_url": runtime_kwargs.get("base_url"),
+            "provider": runtime_kwargs.get("provider"),
+            "api_mode": runtime_kwargs.get("api_mode"),
+            "command": runtime_kwargs.get("command"),
+            "args": list(runtime_kwargs.get("args") or []),
+            "credential_pool": runtime_kwargs.get("credential_pool"),
+        }
 
     # Class-level defaults so partial construction in tests doesn't
     # blow up on attribute access.
@@ -1096,6 +1112,8 @@ class GatewayRunner:
             override_model = override.get("model", model)
             override_runtime = {
                 "provider": override.get("provider"),
+                "requested_provider": override.get("requested_provider"),
+                "source": override.get("source"),
                 "api_key": override.get("api_key"),
                 "base_url": override.get("base_url"),
                 "api_mode": override.get("api_mode"),
@@ -1154,15 +1172,7 @@ class GatewayRunner:
         """
         from hermes_cli.models import resolve_fast_mode_overrides
 
-        runtime = {
-            "api_key": runtime_kwargs.get("api_key"),
-            "base_url": runtime_kwargs.get("base_url"),
-            "provider": runtime_kwargs.get("provider"),
-            "api_mode": runtime_kwargs.get("api_mode"),
-            "command": runtime_kwargs.get("command"),
-            "args": list(runtime_kwargs.get("args") or []),
-            "credential_pool": runtime_kwargs.get("credential_pool"),
-        }
+        runtime = self._agent_runtime_kwargs(runtime_kwargs)
         route = {
             "model": model,
             "runtime": runtime,
@@ -4093,7 +4103,7 @@ class GatewayRunner:
 
         return message_text
 
-    async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
+    async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int = 0):
         """Inner handler that runs under the _running_agents sentinel guard."""
         _msg_start_time = time.time()
         _platform_name = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
@@ -4847,9 +4857,13 @@ class GatewayRunner:
                 last_prompt_tokens=agent_result.get("last_prompt_tokens", 0),
             )
 
-            # Auto voice reply: send TTS audio before the text response
-            _already_sent = bool(agent_result.get("already_sent"))
-            if self._should_send_voice_reply(event, response, agent_messages, already_sent=_already_sent):
+            # Auto voice reply: send TTS audio before the text response.
+            # IMPORTANT: "already_sent" here must mean the FINAL assistant text
+            # already reached the user, not merely that some interim commentary
+            # or partial stream was emitted. Otherwise a streamed status line can
+            # suppress the normal text+voice delivery path for the real answer.
+            _final_response_sent = bool(agent_result.get("final_response_sent"))
+            if self._should_send_voice_reply(event, response, agent_messages, already_sent=_final_response_sent):
                 await self._send_voice_reply(event, response)
 
             # If streaming already delivered the response, extract and
@@ -4863,7 +4877,7 @@ class GatewayRunner:
             # content the user hasn't seen (streaming only sent earlier
             # partial output before the failure).  Without this guard,
             # users see the agent "stop responding without explanation."
-            if agent_result.get("already_sent") and not agent_result.get("failed"):
+            if agent_result.get("final_response_sent") and not agent_result.get("failed"):
                 if response:
                     _media_adapter = self.adapters.get(source.platform)
                     if _media_adapter:
@@ -5522,7 +5536,7 @@ class GatewayRunner:
             switch_model as _switch_model, parse_model_flags,
             list_authenticated_providers,
         )
-        from hermes_cli.providers import get_label
+        from hermes_cli.providers import get_label, resolve_provider_full
 
         raw_args = event.get_command_args().strip()
 
@@ -5564,6 +5578,10 @@ class GatewayRunner:
             current_provider = override.get("provider", current_provider)
             current_base_url = override.get("base_url", current_base_url)
             current_api_key = override.get("api_key", current_api_key)
+        current_provider_ui = override.get("requested_provider") or current_provider
+
+        current_pdef = resolve_provider_full(current_provider_ui, user_provs, custom_provs)
+        current_provider_label = current_pdef.name if current_pdef is not None else get_label(current_provider_ui)
 
         # No args: show interactive picker (Telegram/Discord) or text list
         if not model_input and not explicit_provider:
@@ -5577,7 +5595,7 @@ class GatewayRunner:
             if has_picker:
                 try:
                     providers = list_authenticated_providers(
-                        current_provider=current_provider,
+                        current_provider=current_provider_ui,
                         current_base_url=current_base_url,
                         user_providers=user_provs,
                         custom_providers=custom_provs,
@@ -5692,12 +5710,12 @@ class GatewayRunner:
                         return None  # Picker sent — adapter handles the response
 
             # Fallback: text list (for platforms without picker or if picker failed)
-            provider_label = get_label(current_provider)
+            provider_label = current_provider_label
             lines = [f"Current: `{current_model or 'unknown'}` on {provider_label}", ""]
 
             try:
                 providers = list_authenticated_providers(
-                    current_provider=current_provider,
+                    current_provider=current_provider_ui,
                     current_base_url=current_base_url,
                     user_providers=user_provs,
                     custom_providers=custom_provs,
@@ -5770,7 +5788,9 @@ class GatewayRunner:
         # Store session override so next agent creation uses the new model
         self._session_model_overrides[session_key] = {
             "model": result.new_model,
-            "provider": result.target_provider,
+            "provider": "custom" if str(result.target_provider).startswith("custom:") else result.target_provider,
+            "requested_provider": result.target_provider,
+            "source": f"custom_provider:{result.provider_label}" if str(result.target_provider).startswith("custom:") and result.provider_label else None,
             "api_key": result.api_key,
             "base_url": result.base_url,
             "api_mode": result.api_mode,
@@ -8699,7 +8719,7 @@ class GatewayRunner:
         if not override:
             return model, runtime_kwargs
         model = override.get("model", model)
-        for key in ("provider", "api_key", "base_url", "api_mode"):
+        for key in ("provider", "requested_provider", "source", "api_key", "base_url", "api_mode"):
             val = override.get(key)
             if val is not None:
                 runtime_kwargs[key] = val

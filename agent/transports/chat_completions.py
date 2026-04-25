@@ -218,6 +218,16 @@ class ChatCompletionsTransport(ProviderTransport):
                         _kimi_effort = _e
                 api_kwargs["reasoning_effort"] = _kimi_effort
 
+        # Custom OpenAI-compatible backends: some accept top-level
+        # reasoning_effort on /chat/completions (for example ikuncode.cc).
+        # Forward it for custom providers too, separate from OpenRouter's
+        # extra_body["reasoning"] path.
+        if params.get("is_custom_provider", False) and reasoning_config and isinstance(reasoning_config, dict):
+            _enabled = reasoning_config.get("enabled", True)
+            _effort = (reasoning_config.get("effort") or "").strip().lower()
+            if _enabled and _effort and _effort != "none":
+                api_kwargs["reasoning_effort"] = _effort
+
         # extra_body assembly
         extra_body: Dict[str, Any] = {}
 

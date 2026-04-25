@@ -97,10 +97,19 @@ def _make_adapter():
     adapter._dm_topics_config = []
     adapter._reply_to_mode = "first"
     adapter._fallback_ips = []
-    adapter._polling_conflict_count = 0
     adapter._polling_network_error_count = 0
     adapter._polling_error_callback_ref = None
     adapter.platform = Platform.TELEGRAM
+    adapter._split_short_chat_messages = False
+    adapter._short_chat_delay_base = 0.18
+    adapter._short_chat_delay_per_char = 0.025
+    adapter._short_chat_delay_max = 0.9
+    adapter._long_chunk_delay_base = 0.9
+    adapter._long_chunk_delay_per_char = 0.008
+    adapter._long_chunk_delay_max = 4.0
+    adapter._delay_jitter = 0.0
+    adapter._split_structured_long_messages = False
+    adapter._structured_long_message_max_lines = 6
     return adapter
 
 
