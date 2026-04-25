@@ -11,7 +11,8 @@ import logging
 import re
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING, Dict, Optional
+from typing import TYPE_CHECKING, Dict, List, Optional
+import random
 
 if TYPE_CHECKING:
     from gateway.platforms.base import BasePlatformAdapter, MessageEvent
@@ -262,3 +263,144 @@ def redact_phone(phone: str) -> str:
     if len(phone) <= 8:
         return phone[:2] + "****" + phone[-2:] if len(phone) > 4 else "****"
     return phone[:4] + "****" + phone[-4:]
+
+
+# ─── Short Chat Bubble Splitting ─────────────────────────────────────────────
+
+_TABLE_RULE_RE = re.compile(r"^\s*\|?(?:\s*:?-+:?\s*\|)+\s*$")
+
+
+def _looks_like_chatty_line(text: str, *, max_len: int = 48) -> bool:
+    stripped = text.strip()
+    if not stripped:
+        return False
+    if len(stripped) > max_len:
+        return False
+    if text.startswith((" ", "\t")):
+        return False
+    if stripped.startswith((">", "-", "*", "【", "#", "```", "|")):
+        return False
+    if re.match(r"^\d+\.\s", stripped):
+        return False
+    return True
+
+
+def _looks_like_heading_line(text: str, *, max_len: int = 24) -> bool:
+    stripped = text.strip()
+    if not stripped:
+        return False
+    return len(stripped) <= max_len and stripped.endswith((":", "："))
+
+
+def should_split_short_chat_block(text: str) -> bool:
+    if not text or "```" in text:
+        return False
+    lines = [line for line in text.splitlines() if line.strip()]
+    if not 2 <= len(lines) <= 6:
+        return False
+    if _looks_like_heading_line(lines[0]):
+        return False
+    if any(_TABLE_RULE_RE.match(line.strip()) for line in lines):
+        return False
+    return all(_looks_like_chatty_line(line) for line in lines)
+
+
+def split_short_chat_block(text: str) -> List[str]:
+    if not should_split_short_chat_block(text):
+        return [text]
+    return [line.strip() for line in text.splitlines() if line.strip()]
+
+
+def compute_short_chat_delay(text: str, *, base: float = 0.18, per_char: float = 0.025, max_delay: float = 0.9, jitter: float = 0.0) -> float:
+    visible_len = len((text or '').strip())
+    delay = base + visible_len * per_char
+    if jitter > 0:
+        delay += random.uniform(-jitter, jitter)
+    return max(base, min(delay, max_delay))
+
+
+def compute_long_chunk_delay(text: str, *, base: float = 0.9, per_char: float = 0.008, max_delay: float = 4.0, jitter: float = 0.0) -> float:
+    visible_len = len((text or '').strip())
+    delay = base + visible_len * per_char
+    if jitter > 0:
+        delay += random.uniform(-jitter, jitter)
+    return max(base, min(delay, max_delay))
+
+
+def split_structured_long_message(text: str, *, max_lines: int = 6) -> List[str]:
+    if not text or '\n' not in text:
+        return [text]
+
+    heading_re = re.compile(r'^(?:#{1,6}\s+.+|(?:第[一二三四五六七八九十百0-9]+[章节部分篇])|(?:[一二三四五六七八九十]+[、.．])|(?:\d+[、.．])|(?:[A-Za-z][、.．:：]))')
+    known_heading_lines = {"结论", "总结", "说明", "补充说明", "注意", "备注", "原因", "现状", "状态", "下一步", "我做了什么", "这次新增了什么", "我刚做的事", "我核到的真实情况"}
+
+    def is_heading_line(line: str) -> bool:
+        first = (line or '').strip()
+        if not first:
+            return False
+        if heading_re.match(first):
+            return True
+        if first in known_heading_lines:
+            return True
+        return False
+
+    def is_heading_block(block: str) -> bool:
+        lines = [line.strip() for line in block.splitlines() if line.strip()]
+        if not lines:
+            return False
+        return is_heading_line(lines[0])
+
+    normalized = text.replace('\r\n', '\n')
+    raw_blocks = [block.strip() for block in re.split(r'\n\s*\n', normalized) if block.strip()]
+
+    def coalesce_blocks(blocks: List[str], *, preserve_blank_separated_blocks: bool = False) -> List[str]:
+        sections: List[str] = []
+        current: List[str] = []
+        current_lines = 0
+
+        for block in blocks:
+            block_lines = block.count('\n') + 1
+            heading_block = is_heading_block(block)
+            should_flush = False
+            if current:
+                should_flush = heading_block or current_lines + block_lines > max_lines
+                if preserve_blank_separated_blocks and not heading_block:
+                    should_flush = True
+            if should_flush:
+                sections.append('\n\n'.join(current).strip())
+                current = [block]
+                current_lines = block_lines
+            else:
+                current.append(block)
+                current_lines += block_lines
+
+        if current:
+            sections.append('\n\n'.join(current).strip())
+        return sections
+
+    if len(raw_blocks) > 1:
+        sections = coalesce_blocks(raw_blocks, preserve_blank_separated_blocks=True)
+        return sections if len(sections) > 1 else [text]
+
+    logical_blocks: List[str] = []
+    current_lines: List[str] = []
+    for raw_line in normalized.splitlines():
+        line = raw_line.strip()
+        if not line:
+            if current_lines:
+                logical_blocks.append('\n'.join(current_lines).strip())
+                current_lines = []
+            continue
+        if current_lines and is_heading_line(line):
+            logical_blocks.append('\n'.join(current_lines).strip())
+            current_lines = [line]
+        else:
+            current_lines.append(line)
+    if current_lines:
+        logical_blocks.append('\n'.join(current_lines).strip())
+
+    if len(logical_blocks) <= 1:
+        return [text]
+
+    sections = coalesce_blocks(logical_blocks)
+    return sections if len(sections) > 1 else [text]
