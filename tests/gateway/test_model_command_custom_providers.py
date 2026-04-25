@@ -61,3 +61,52 @@ async def test_handle_model_command_lists_saved_custom_provider(tmp_path, monkey
     assert "Local (127.0.0.1:4141)" in result
     assert "custom:local-(127.0.0.1:4141)" in result
     assert "rotator-openrouter-coding" in result
+
+
+@pytest.mark.asyncio
+async def test_handle_model_command_shows_named_custom_provider_as_current(tmp_path, monkeypatch):
+    hermes_home = tmp_path / ".hermes"
+    hermes_home.mkdir()
+    (hermes_home / "config.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "model": {
+                    "default": "claude-sonnet-4-6",
+                    "provider": "anthropic",
+                    "base_url": "https://api.anthropic.com",
+                },
+                "providers": {},
+                "custom_providers": [
+                    {
+                        "name": "IkunCodeGPT",
+                        "base_url": "https://api.ikuncode.cc/v1",
+                        "model": "gpt-5.4",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    import gateway.run as gateway_run
+
+    runner = _make_runner()
+    session_key = runner._session_key_for_source(_make_event().source)
+    runner._session_model_overrides[session_key] = {
+        "model": "gpt-5.4",
+        "provider": "custom",
+        "requested_provider": "custom:ikuncodegpt",
+        "source": "custom_provider:IkunCodeGPT",
+        "api_key": "sk-gpt",
+        "base_url": "https://api.ikuncode.cc/v1",
+        "api_mode": "chat_completions",
+    }
+
+    monkeypatch.setattr(gateway_run, "_hermes_home", hermes_home)
+    monkeypatch.setattr("agent.models_dev.fetch_models_dev", lambda: {})
+
+    result = await runner._handle_model_command(_make_event())
+
+    assert result is not None
+    assert "Current: `gpt-5.4` on IkunCodeGPT" in result
+    assert "**IkunCodeGPT** `--provider custom:ikuncodegpt` (current):" in result

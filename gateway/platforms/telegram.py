@@ -81,6 +81,7 @@ from gateway.platforms.telegram_network import (
     discover_fallback_ips,
     parse_fallback_ip_env,
 )
+from gateway.platforms.helpers import split_short_chat_block
 
 
 def check_telegram_requirements() -> bool:
@@ -145,6 +146,16 @@ class TelegramAdapter(BasePlatformAdapter):
         self._mention_patterns = self._compile_mention_patterns()
         self._reply_to_mode: str = getattr(config, 'reply_to_mode', 'first') or 'first'
         self._disable_link_previews: bool = self._coerce_bool_extra("disable_link_previews", False)
+        self._split_short_chat_messages: bool = self._coerce_bool_extra("split_short_chat_messages", False)
+        self._short_chat_delay_base: float = float(self.config.extra.get("short_chat_delay_base", 0.18))
+        self._short_chat_delay_per_char: float = float(self.config.extra.get("short_chat_delay_per_char", 0.025))
+        self._short_chat_delay_max: float = float(self.config.extra.get("short_chat_delay_max", 0.9))
+        self._long_chunk_delay_base: float = float(self.config.extra.get("long_chunk_delay_base", 0.9))
+        self._long_chunk_delay_per_char: float = float(self.config.extra.get("long_chunk_delay_per_char", 0.008))
+        self._long_chunk_delay_max: float = float(self.config.extra.get("long_chunk_delay_max", 4.0))
+        self._delay_jitter: float = float(self.config.extra.get("delay_jitter", 0.0))
+        self._split_structured_long_messages: bool = self._coerce_bool_extra("split_structured_long_messages", False)
+        self._structured_long_message_max_lines: int = int(self.config.extra.get("structured_long_message_max_lines", 6))
         # Buffer rapid/album photo updates so Telegram image bursts are handled
         # as a single MessageEvent instead of self-interrupting multiple turns.
         self._media_batch_delay_seconds = float(os.getenv("HERMES_TELEGRAM_MEDIA_BATCH_DELAY_SECONDS", "0.8"))
@@ -861,17 +872,27 @@ class TelegramAdapter(BasePlatformAdapter):
         try:
             # Format and split message if needed
             formatted = self.format_message(content)
-            chunks = self.truncate_message(
-                formatted, self.MAX_MESSAGE_LENGTH, len_fn=utf16_len,
+            base_units = split_short_chat_block(formatted) if self._split_short_chat_messages else [formatted]
+            logger.debug(
+                "[%s debug] telegram.send split_short=%s content_len=%d formatted_len=%d base_units_count=%d base_unit_lens=%r",
+                self.name,
+                self._split_short_chat_messages,
+                len(content),
+                len(formatted),
+                len(base_units),
+                [len(unit) for unit in base_units],
             )
-            if len(chunks) > 1:
-                # truncate_message appends a raw " (1/2)" suffix. Escape the
-                # MarkdownV2-special parentheses so Telegram doesn't reject the
-                # chunk and fall back to plain text.
-                chunks = [
-                    re.sub(r" \((\d+)/(\d+)\)$", r" \\(\1/\2\\)", chunk)
-                    for chunk in chunks
-                ]
+            chunks = []
+            for unit in base_units:
+                unit_chunks = self.truncate_message(
+                    unit, self.MAX_MESSAGE_LENGTH, len_fn=utf16_len,
+                )
+                if len(unit_chunks) > 1:
+                    unit_chunks = [
+                        re.sub(r" \((\d+)/(\d+)\)$", r" \\(\1/\2\\)", chunk)
+                        for chunk in unit_chunks
+                    ]
+                chunks.extend(unit_chunks)
             
             message_ids = []
             thread_id = self._metadata_thread_id(metadata)

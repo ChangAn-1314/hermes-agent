@@ -264,6 +264,11 @@ class ContextTokenStore:
         self._cache[self._key(account_id, user_id)] = token
         self._persist(account_id)
 
+    def clear(self, account_id: str, user_id: str) -> None:
+        key = self._key(account_id, user_id)
+        if self._cache.pop(key, None) is not None:
+            self._persist(account_id)
+
     def _persist(self, account_id: str) -> None:
         prefix = f"{account_id}:"
         payload = {
@@ -345,7 +350,15 @@ async def _api_post(
         raw = await response.text()
         if not response.ok:
             raise RuntimeError(f"iLink POST {endpoint} HTTP {response.status}: {raw[:200]}")
-        return json.loads(raw)
+        data = json.loads(raw)
+        ret = data.get("ret", 0)
+        errcode = data.get("errcode", 0)
+        if ret not in (0, None) or errcode not in (0, None):
+            errmsg = data.get("errmsg", "")
+            raise RuntimeError(
+                f"iLink POST {endpoint} business error: ret={ret} errcode={errcode} errmsg={errmsg}"
+            )
+        return data
 
 
 async def _api_get(
@@ -775,26 +788,78 @@ def _should_split_short_chat_block_for_weixin(block: str) -> bool:
 
 
 def _pack_markdown_blocks_for_weixin(content: str, max_length: int) -> List[str]:
-    if len(content) <= max_length:
+    if len(content.encode("utf-8")) <= max_length:
         return [content]
 
     packed: List[str] = []
     current = ""
     for block in _split_markdown_blocks(content):
         candidate = block if not current else f"{current}\n\n{block}"
-        if len(candidate) <= max_length:
+        if len(candidate.encode("utf-8")) <= max_length:
             current = candidate
             continue
         if current:
             packed.append(current)
             current = ""
-        if len(block) <= max_length:
+        if len(block.encode("utf-8")) <= max_length:
             current = block
             continue
-        packed.extend(BasePlatformAdapter.truncate_message(block, max_length))
+        packed.extend(_truncate_text_by_utf8_bytes(block, max_length))
     if current:
         packed.append(current)
     return packed
+
+
+def _truncate_text_by_utf8_bytes(text: str, max_length: int) -> List[str]:
+    if not text:
+        return []
+    if len(text.encode("utf-8")) <= max_length:
+        return [text]
+
+    lines = text.splitlines()
+    if lines and _FENCE_RE.match(lines[0].strip()) and lines[-1].strip() == "```":
+        header = lines[0]
+        footer = lines[-1]
+        body_lines = lines[1:-1]
+        chunks: List[str] = []
+        current: List[str] = []
+        current_bytes = len(f"{header}\n{footer}".encode("utf-8"))
+        if body_lines:
+            current_bytes += len("\n".encode("utf-8"))
+
+        for line in body_lines:
+            line_bytes = len(line.encode("utf-8"))
+            newline_bytes = len("\n".encode("utf-8")) if current else 0
+            projected = current_bytes + newline_bytes + line_bytes
+            if current and projected > max_length:
+                chunks.append(f"{header}\n" + "\n".join(current) + f"\n{footer}")
+                current = [line]
+                current_bytes = len(f"{header}\n{line}\n{footer}".encode("utf-8"))
+                continue
+            current.append(line)
+            current_bytes = projected
+
+        if current:
+            chunks.append(f"{header}\n" + "\n".join(current) + f"\n{footer}")
+        return chunks
+
+    chunks: List[str] = []
+    current: List[str] = []
+    current_bytes = 0
+
+    for ch in text:
+        ch_bytes = len(ch.encode("utf-8"))
+        if current and current_bytes + ch_bytes > max_length:
+            chunks.append("".join(current))
+            current = [ch]
+            current_bytes = ch_bytes
+            continue
+        current.append(ch)
+        current_bytes += ch_bytes
+
+    if current:
+        chunks.append("".join(current))
+    return chunks
 
 
 def _split_text_for_weixin_delivery(
@@ -819,11 +884,11 @@ def _split_text_for_weixin_delivery(
         return []
     if split_per_line:
         # Legacy: one message per top-level delivery unit.
-        if len(content) <= max_length and "\n" not in content:
+        if len(content.encode("utf-8")) <= max_length and "\n" not in content:
             return [content]
         chunks: List[str] = []
         for unit in _split_delivery_units_for_weixin(content):
-            if len(unit) <= max_length:
+            if len(unit.encode("utf-8")) <= max_length:
                 chunks.append(unit)
                 continue
             chunks.extend(_pack_markdown_blocks_for_weixin(unit, max_length))
@@ -832,7 +897,7 @@ def _split_text_for_weixin_delivery(
     # Compact (default): single message when under the limit — unless the
     # content looks like a short chatty exchange, in which case split into
     # separate bubbles for a more natural chat feel.
-    if len(content) <= max_length:
+    if len(content.encode("utf-8")) <= max_length:
         return (
             [u for u in _split_delivery_units_for_weixin(content) if u]
             if _should_split_short_chat_block_for_weixin(content)
@@ -1418,6 +1483,7 @@ class WeixinAdapter(BasePlatformAdapter):
     ) -> None:
         """Send a single text chunk with per-chunk retry and backoff."""
         last_error: Optional[Exception] = None
+        current_context_token = context_token
         for attempt in range(self._send_chunk_retries + 1):
             try:
                 await _send_message(
@@ -1426,12 +1492,21 @@ class WeixinAdapter(BasePlatformAdapter):
                     token=self._token,
                     to=chat_id,
                     text=chunk,
-                    context_token=context_token,
+                    context_token=current_context_token,
                     client_id=client_id,
                 )
                 return
             except Exception as exc:
                 last_error = exc
+                if "ret=-2" in str(exc) and current_context_token:
+                    logger.warning(
+                        "[%s] context_token rejected for %s; clearing cached token and retrying without it",
+                        self.name,
+                        _safe_id(chat_id),
+                    )
+                    self._token_store.clear(self._account_id, chat_id)
+                    current_context_token = None
+                    continue
                 if attempt >= self._send_chunk_retries:
                     break
                 wait = self._send_chunk_retry_delay_seconds * (attempt + 1)

@@ -5233,6 +5233,12 @@ class AIAgent:
         if not visible or visible == "(empty)":
             return
         already_streamed = self._interim_content_was_streamed(visible)
+        logger.warning(
+            "[run_agent stream] interim emit len=%d already_streamed=%s has_callback=%s",
+            len(visible),
+            already_streamed,
+            cb is not None,
+        )
         try:
             cb(visible, already_streamed=already_streamed)
         except Exception:
@@ -5242,13 +5248,19 @@ class AIAgent:
         """Fire all registered stream delta callbacks (display + TTS)."""
         # If a tool iteration set the break flag, prepend a single paragraph
         # break before the first real text delta.  This prevents the original
-        # problem (text concatenation across tool boundaries) without stacking
-        # blank lines when multiple tool iterations run back-to-back.
+        # message from being edited above later tool progress messages.
         if getattr(self, "_stream_needs_break", False) and text and text.strip():
             self._stream_needs_break = False
             text = "\n\n" + text
         callbacks = [cb for cb in (self.stream_delta_callback, self._stream_callback) if cb is not None]
+        logger.warning(
+            "[run_agent stream] fire_delta len=%d callbacks=%d needs_break=%s",
+            len(text or ""),
+            len(callbacks),
+            getattr(self, "_stream_needs_break", False),
+        )
         delivered = False
+
         for cb in callbacks:
             try:
                 cb(text)
@@ -5346,6 +5358,11 @@ class AIAgent:
 
                     def _on_text(text):
                         _fire_first()
+                        logger.warning(
+                            "[run_agent stream] anthropic on_text len=%d has_consumers=%s",
+                            len(text or ""),
+                            self._has_stream_consumers(),
+                        )
                         self._fire_stream_delta(text)
                         deltas_were_sent["yes"] = True
 
@@ -6698,6 +6715,16 @@ class AIAgent:
 
         extra_body = {}
 
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "Runtime debug snapshot: model=%s provider=%s api_mode=%s base_url=%s reasoning_config=%r",
+                self.model,
+                self.provider,
+                self.api_mode,
+                self.base_url,
+                self.reasoning_config,
+            )
+
         _is_openrouter = self._is_openrouter_url()
         _is_github_models = (
             "models.github.ai" in self._base_url_lower
@@ -6751,11 +6778,42 @@ class AIAgent:
         # This prevents thinking-capable models (Qwen3, etc.) from generating
         # <think> blocks and producing empty-response errors when the user has
         # set reasoning_effort: none.
+        #
+        # Custom provider (chat_completions): also forward reasoning_effort as a
+        # top-level field so OpenAI-compatible backends (e.g. ikuncode.cc) that
+        # accept "reasoning_effort" on /chat/completions actually receive it.
+        # This is separate from the OpenRouter extra_body["reasoning"] path.
         if self.provider == "custom" and self.reasoning_config and isinstance(self.reasoning_config, dict):
+            logger.warning(
+                "Build API kwargs state: provider=%r api_mode=%r base_url=%r reasoning_config=%r model=%r",
+                self.provider,
+                self.api_mode,
+                self.base_url,
+                self.reasoning_config,
+                self.model,
+            )
             _effort = (self.reasoning_config.get("effort") or "").strip().lower()
             _enabled = self.reasoning_config.get("enabled", True)
             if _effort == "none" or _enabled is False:
                 extra_body["think"] = False
+            elif _enabled and _effort:
+                # Forward as top-level reasoning_effort for OpenAI-compat backends
+                api_kwargs["reasoning_effort"] = _effort
+                logger.warning(
+                    "Custom reasoning injection: model=%r reasoning_effort=%r keys=%r",
+                    self.model,
+                    _effort,
+                    list(api_kwargs.keys()),
+                )
+        else:
+            logger.debug(
+                "Reasoning injection skipped: provider=%r api_mode=%r base_url=%r model=%r reasoning_config=%r",
+                self.provider,
+                self.api_mode,
+                self.base_url,
+                self.model,
+                self.reasoning_config,
+            )
 
         if self._is_qwen_portal():
             extra_body["vl_high_resolution_images"] = True

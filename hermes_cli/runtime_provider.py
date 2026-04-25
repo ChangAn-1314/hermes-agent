@@ -221,9 +221,29 @@ def resolve_requested_provider(requested: Optional[str] = None) -> str:
         return requested.strip().lower()
 
     model_cfg = _get_model_config()
-    cfg_provider = model_cfg.get("provider")
-    if isinstance(cfg_provider, str) and cfg_provider.strip():
-        return cfg_provider.strip().lower()
+    cfg_provider = str(model_cfg.get("provider") or "").strip().lower()
+    cfg_model = str(model_cfg.get("default") or "").strip()
+    cfg_base_url = str(model_cfg.get("base_url") or "").strip().rstrip("/")
+
+    # When config points at a generic custom provider, prefer a matching named
+    # custom_providers entry so runtime resolution preserves per-provider api_key,
+    # api_mode, and source instead of collapsing everything to bare "custom".
+    if cfg_provider == "custom" and cfg_base_url:
+        config = load_config()
+        for entry in get_compatible_custom_providers(config) or []:
+            if not isinstance(entry, dict):
+                continue
+            entry_base = str(entry.get("base_url") or "").strip().rstrip("/")
+            entry_model = str(entry.get("model") or "").strip()
+            entry_name = str(entry.get("name") or "").strip()
+            if not entry_name or entry_base != cfg_base_url:
+                continue
+            if cfg_model and entry_model and entry_model != cfg_model:
+                continue
+            return f"custom:{_normalize_custom_provider_name(entry_name)}"
+
+    if cfg_provider:
+        return cfg_provider
 
     # Prefer the persisted config selection over any stale shell/.env
     # provider override so chat uses the endpoint the user last saved.
@@ -390,16 +410,6 @@ def _resolve_named_custom_runtime(
     ).rstrip("/")
     if not base_url:
         return None
-
-    # Check if a credential pool exists for this custom endpoint
-    pool_result = _try_resolve_from_custom_pool(base_url, "custom", custom_provider.get("api_mode"))
-    if pool_result:
-        # Propagate the model name even when using pooled credentials —
-        # the pool doesn't know about the custom_providers model field.
-        model_name = custom_provider.get("model")
-        if model_name:
-            pool_result["model"] = model_name
-        return pool_result
 
     api_key_candidates = [
         (explicit_api_key or "").strip(),

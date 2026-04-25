@@ -19,9 +19,12 @@ import asyncio
 import logging
 import queue
 import re
+import threading
 import time
 from dataclasses import dataclass
 from typing import Any, Optional
+
+from gateway.platforms.helpers import split_short_chat_block, should_split_short_chat_block, compute_short_chat_delay, compute_long_chunk_delay, split_structured_long_message
 
 logger = logging.getLogger("gateway.stream_consumer")
 
@@ -88,7 +91,18 @@ class GatewayStreamConsumer:
         self.chat_id = chat_id
         self.cfg = config or StreamConsumerConfig()
         self.metadata = metadata
-        self._queue: queue.Queue = queue.Queue()
+        self._queue: asyncio.Queue = asyncio.Queue()
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._pending_preloop: list[Any] = []
+        self._pending_lock = threading.Lock()
+        self._consumer_id = id(self)
+        self._queue_id = id(self._queue)
+        logger.warning(
+            "[stream_consumer ident] init chat=%s consumer_id=%s queue_id=%s",
+            self.chat_id,
+            self._consumer_id,
+            self._queue_id,
+        )
         self._accumulated = ""
         self._message_id: Optional[str] = None
         self._already_sent = False
@@ -100,6 +114,16 @@ class GatewayStreamConsumer:
         self._flood_strikes = 0         # Consecutive flood-control edit failures
         self._current_edit_interval = self.cfg.edit_interval  # Adaptive backoff
         self._final_response_sent = False
+
+        self._short_chat_delay_base = float(getattr(adapter, "_short_chat_delay_base", 0.18))
+        self._short_chat_delay_per_char = float(getattr(adapter, "_short_chat_delay_per_char", 0.025))
+        self._short_chat_delay_max = float(getattr(adapter, "_short_chat_delay_max", 0.9))
+        self._long_chunk_delay_base = float(getattr(adapter, "_long_chunk_delay_base", 0.9))
+        self._long_chunk_delay_per_char = float(getattr(adapter, "_long_chunk_delay_per_char", 0.008))
+        self._long_chunk_delay_max = float(getattr(adapter, "_long_chunk_delay_max", 4.0))
+        self._delay_jitter = float(getattr(adapter, "_delay_jitter", 0.0))
+        self._split_structured_long_messages = bool(getattr(adapter, "_split_structured_long_messages", False))
+        self._structured_long_message_max_lines = int(getattr(adapter, "_structured_long_message_max_lines", 6))
 
         # Think-block filter state (mirrors CLI's _stream_delta tag suppression)
         self._in_think_block = False
@@ -115,14 +139,43 @@ class GatewayStreamConsumer:
         """True when the stream consumer delivered the final assistant reply."""
         return self._final_response_sent
 
+    async def _async_enqueue(self, item: Any) -> None:
+        await self._queue.put(item)
+
+    def _enqueue_item(self, item: Any) -> None:
+        """Thread-safe enqueue that buffers events until the run loop is ready."""
+        if self._loop and self._loop.is_running():
+            asyncio.run_coroutine_threadsafe(self._async_enqueue(item), self._loop)
+            return
+        with self._pending_lock:
+            self._pending_preloop.append(item)
+
     def on_segment_break(self) -> None:
         """Finalize the current stream segment and start a fresh message."""
-        self._queue.put(_NEW_SEGMENT)
+        logger.warning(
+            "[stream_consumer ident] on_segment_break chat=%s consumer_id=%s queue_id=%s",
+            self.chat_id,
+            self._consumer_id,
+            self._queue_id,
+        )
+        logger.warning("[stream_consumer queue] on_segment_break chat=%s", self.chat_id)
+        self._enqueue_item(_NEW_SEGMENT)
 
     def on_commentary(self, text: str) -> None:
         """Queue a completed interim assistant commentary message."""
         if text:
-            self._queue.put((_COMMENTARY, text))
+            logger.warning(
+                "[stream_consumer ident] on_commentary chat=%s consumer_id=%s queue_id=%s",
+                self.chat_id,
+                self._consumer_id,
+                self._queue_id,
+            )
+            logger.warning(
+                "[stream_consumer queue] on_commentary chat=%s text_len=%d",
+                self.chat_id,
+                len(text),
+            )
+            self._enqueue_item((_COMMENTARY, text))
 
     def _reset_segment_state(self, *, preserve_no_edit: bool = False) -> None:
         if preserve_no_edit and self._message_id == "__no_edit__":
@@ -141,13 +194,38 @@ class GatewayStreamConsumer:
         appears below any tool-progress messages the gateway sent in between.
         """
         if text:
-            self._queue.put(text)
+            logger.warning(
+                "[stream_consumer ident] on_delta chat=%s consumer_id=%s queue_id=%s",
+                self.chat_id,
+                self._consumer_id,
+                self._queue_id,
+            )
+            logger.warning(
+                "[stream_consumer queue] on_delta chat=%s text_len=%d",
+                self.chat_id,
+                len(text),
+            )
+            self._enqueue_item(text)
         elif text is None:
+            logger.warning(
+                "[stream_consumer ident] on_delta segment-break chat=%s consumer_id=%s queue_id=%s",
+                self.chat_id,
+                self._consumer_id,
+                self._queue_id,
+            )
+            logger.warning("[stream_consumer queue] on_delta segment-break chat=%s", self.chat_id)
             self.on_segment_break()
 
     def finish(self) -> None:
         """Signal that the stream is complete."""
-        self._queue.put(_DONE)
+        logger.warning(
+            "[stream_consumer ident] finish chat=%s consumer_id=%s queue_id=%s",
+            self.chat_id,
+            self._consumer_id,
+            self._queue_id,
+        )
+        logger.warning("[stream_consumer lifecycle] finish called chat=%s", self.chat_id)
+        self._enqueue_item(_DONE)
 
     # ── Think-block filtering ────────────────────────────────────────
     # Models like MiniMax emit inline <think>...</think> blocks in their
@@ -262,26 +340,83 @@ class GatewayStreamConsumer:
         _safe_limit = max(500, _raw_limit - len(self.cfg.cursor) - 100)
 
         try:
+            self._loop = asyncio.get_running_loop()
+            logger.warning(
+                "[stream_consumer ident] run-start chat=%s consumer_id=%s queue_id=%s",
+                self.chat_id,
+                self._consumer_id,
+                self._queue_id,
+            )
+            with self._pending_lock:
+                pending_preloop = list(self._pending_preloop)
+                self._pending_preloop.clear()
+            for pending_item in pending_preloop:
+                await self._queue.put(pending_item)
             while True:
-                # Drain all available items from the queue
+                # Block for the first item so idle streams don't busy-loop.
+                item = await self._queue.get()
+
+                # Drain all available items from the queue, starting with the
+                # first blocking item we just received.
                 got_done = False
                 got_segment_break = False
                 commentary_text = None
+                pending_items = [item]
                 while True:
                     try:
-                        item = self._queue.get_nowait()
-                        if item is _DONE:
-                            got_done = True
-                            break
-                        if item is _NEW_SEGMENT:
-                            got_segment_break = True
-                            break
-                        if isinstance(item, tuple) and len(item) == 2 and item[0] is _COMMENTARY:
-                            commentary_text = item[1]
-                            break
-                        self._filter_and_accumulate(item)
-                    except queue.Empty:
+                        pending_items.append(self._queue.get_nowait())
+                    except asyncio.QueueEmpty:
                         break
+
+                # Briefly coalesce high-frequency token bursts so streaming
+                # deltas emitted back-to-back from another thread are consumed
+                # in the same batch instead of falling into a timing gap.
+                batch_deadline = time.monotonic() + 0.03
+                while time.monotonic() < batch_deadline:
+                    await asyncio.sleep(0.005)
+                    drained_any = False
+                    while True:
+                        try:
+                            pending_items.append(self._queue.get_nowait())
+                            drained_any = True
+                        except asyncio.QueueEmpty:
+                            break
+                    if not drained_any:
+                        continue
+
+                for item in pending_items:
+                    logger.warning(
+                        "[stream_consumer queue] dequeued chat=%s item_type=%s",
+                        self.chat_id,
+                        (
+                            "done" if item is _DONE else
+                            "segment_break" if item is _NEW_SEGMENT else
+                            "commentary" if isinstance(item, tuple) and len(item) == 2 and item[0] is _COMMENTARY else
+                            type(item).__name__
+                        ),
+                    )
+                    if item is _DONE:
+                        got_done = True
+                        break
+                    if item is _NEW_SEGMENT:
+                        got_segment_break = True
+                        break
+                    if isinstance(item, tuple) and len(item) == 2 and item[0] is _COMMENTARY:
+                        commentary_text = item[1]
+                        break
+                    if isinstance(item, str):
+                        self._filter_and_accumulate(item)
+                        logger.warning(
+                            "[stream_consumer queue] accumulated chat=%s new_len=%d",
+                            self.chat_id,
+                            len(self._accumulated),
+                        )
+                        continue
+                    logger.warning(
+                        "[stream_consumer queue] ignored chat=%s unexpected_type=%s",
+                        self.chat_id,
+                        type(item).__name__,
+                    )
 
                 # Flush any held-back partial-tag buffer on stream end
                 # so trailing text that was waiting for a potential open
@@ -292,6 +427,17 @@ class GatewayStreamConsumer:
                 # Decide whether to flush an edit
                 now = time.monotonic()
                 elapsed = now - self._last_edit_time
+                logger.warning(
+                    "[stream_consumer lifecycle] chat=%s got_done=%s got_segment_break=%s commentary=%s accumulated_len=%d message_id_present=%s already_sent=%s edit_supported=%s",
+                    self.chat_id,
+                    got_done,
+                    got_segment_break,
+                    commentary_text is not None,
+                    len(self._accumulated),
+                    self._message_id is not None,
+                    self._already_sent,
+                    self._edit_supported,
+                )
                 should_edit = (
                     got_done
                     or got_segment_break
@@ -306,6 +452,72 @@ class GatewayStreamConsumer:
 
                 current_update_visible = False
                 if should_edit and self._accumulated:
+                    if (
+                        got_done
+                        and getattr(self.adapter, "_split_short_chat_messages", False)
+                        and self._message_id is None
+                        and should_split_short_chat_block(self._accumulated)
+                    ):
+                        split_units = split_short_chat_block(self._accumulated)
+                        logger.warning(
+                            "[stream_consumer split] short-chat final path chat=%s message_id_none=%s units=%d accumulated_len=%d",
+                            self.chat_id,
+                            self._message_id is None,
+                            len(split_units),
+                            len(self._accumulated),
+                        )
+                        for idx, unit in enumerate(split_units):
+                            if idx > 0:
+                                await asyncio.sleep(
+                                    compute_short_chat_delay(
+                                        unit,
+                                        base=self._short_chat_delay_base,
+                                        per_char=self._short_chat_delay_per_char,
+                                        max_delay=self._short_chat_delay_max,
+                                        jitter=self._delay_jitter,
+                                    )
+                                )
+                            await self._send_new_chunk(unit, self._message_id)
+                        self._accumulated = ""
+                        self._last_sent_text = ""
+                        self._last_edit_time = time.monotonic()
+                        self._final_response_sent = self._already_sent
+                        return
+                    if (
+                        got_done
+                        and self._split_structured_long_messages
+                        and self._message_id is None
+                    ):
+                        structured_units = split_structured_long_message(
+                            self._accumulated,
+                            max_lines=self._structured_long_message_max_lines,
+                        )
+                        logger.warning(
+                            "[stream_consumer split] structured pre-send path chat=%s message_id_none=%s units=%d accumulated_len=%d max_lines=%d",
+                            self.chat_id,
+                            self._message_id is None,
+                            len(structured_units),
+                            len(self._accumulated),
+                            self._structured_long_message_max_lines,
+                        )
+                        if len(structured_units) > 1:
+                            for idx, unit in enumerate(structured_units):
+                                if idx > 0:
+                                    await asyncio.sleep(
+                                        compute_long_chunk_delay(
+                                            unit,
+                                            base=self._long_chunk_delay_base,
+                                            per_char=self._long_chunk_delay_per_char,
+                                            max_delay=self._long_chunk_delay_max,
+                                            jitter=self._delay_jitter,
+                                        )
+                                    )
+                                self._message_id = await self._send_new_chunk(unit, self._message_id)
+                            self._accumulated = ""
+                            self._last_sent_text = ""
+                            self._last_edit_time = time.monotonic()
+                            self._final_response_sent = self._already_sent
+                            return
                     # Split overflow: if accumulated text exceeds the platform
                     # limit, split into properly sized chunks.
                     if (
@@ -363,13 +575,105 @@ class GatewayStreamConsumer:
 
                     current_update_visible = await self._send_or_edit(display_text)
                     self._last_edit_time = time.monotonic()
+                    logger.warning(
+                        "[stream_consumer lifecycle] after send_or_edit chat=%s current_update_visible=%s message_id_present=%s already_sent=%s fallback_final=%s display_len=%d",
+                        self.chat_id,
+                        current_update_visible,
+                        self._message_id is not None,
+                        self._already_sent,
+                        self._fallback_final_send,
+                        len(display_text),
+                    )
 
-                if got_done:
+                    if got_done:
+                        logger.warning(
+                            "[stream_consumer lifecycle] entering final block chat=%s message_id_present=%s already_sent=%s fallback_final=%s accumulated_len=%d",
+                            self.chat_id,
+                            self._message_id is not None,
+                            self._already_sent,
+                            self._fallback_final_send,
+                            len(self._accumulated),
+                        )
+                        final_structured_source = self._clean_for_display(self._accumulated)
+                        logger.warning(
+                            "[stream_consumer split] final-edit path chat=%s message_id_present=%s edit_supported=%s accumulated_len=%d cleaned_len=%d structured_enabled=%s",
+                            self.chat_id,
+                            self._message_id is not None,
+                            self._edit_supported,
+                            len(self._accumulated),
+                            len(final_structured_source),
+                            self._split_structured_long_messages,
+                        )
+                        if (
+                            self._split_structured_long_messages
+                            and final_structured_source.strip()
+                        ):
+                            structured_units = split_structured_long_message(
+                                final_structured_source,
+                                max_lines=self._structured_long_message_max_lines,
+                            )
+                            logger.warning(
+                                "[stream_consumer split] final-edit structured probe chat=%s message_id_present=%s units=%d cleaned_len=%d max_lines=%d",
+                                self.chat_id,
+                                self._message_id is not None,
+                                len(structured_units),
+                                len(final_structured_source),
+                                self._structured_long_message_max_lines,
+                            )
+                            if len(structured_units) > 1:
+                                if self._message_id and self._edit_supported:
+                                    first_unit = structured_units[0]
+                                    first_ok = await self._send_or_edit(first_unit)
+                                    if first_ok:
+                                        previous_message_id = self._message_id
+                                        self._last_sent_text = first_unit
+                                        for idx, unit in enumerate(structured_units[1:], start=1):
+                                            await asyncio.sleep(
+                                                compute_long_chunk_delay(
+                                                    unit,
+                                                    base=self._long_chunk_delay_base,
+                                                    per_char=self._long_chunk_delay_per_char,
+                                                    max_delay=self._long_chunk_delay_max,
+                                                    jitter=self._delay_jitter,
+                                                )
+                                            )
+                                            previous_message_id = await self._send_new_chunk(unit, previous_message_id)
+                                        self._accumulated = ""
+                                        self._last_edit_time = time.monotonic()
+                                        self._final_response_sent = self._already_sent
+                                        return
+                                elif self._message_id is None:
+                                    for idx, unit in enumerate(structured_units):
+                                        if idx > 0:
+                                            await asyncio.sleep(
+                                                compute_long_chunk_delay(
+                                                    unit,
+                                                    base=self._long_chunk_delay_base,
+                                                    per_char=self._long_chunk_delay_per_char,
+                                                    max_delay=self._long_chunk_delay_max,
+                                                    jitter=self._delay_jitter,
+                                                )
+                                            )
+                                        self._message_id = await self._send_new_chunk(unit, self._message_id)
+                                    self._accumulated = ""
+                                    self._last_sent_text = ""
+                                    self._last_edit_time = time.monotonic()
+                                    self._final_response_sent = self._already_sent
+                                    return
                     # Final edit without cursor. If progressive editing failed
                     # mid-stream, send a single continuation/fallback message
                     # here instead of letting the base gateway path send the
                     # full response again.
                     if self._accumulated:
+                        logger.warning(
+                            "[stream_consumer lifecycle] final delivery decision chat=%s fallback_final=%s current_update_visible=%s message_id_present=%s already_sent=%s accumulated_len=%d",
+                            self.chat_id,
+                            self._fallback_final_send,
+                            current_update_visible,
+                            self._message_id is not None,
+                            self._already_sent,
+                            len(self._accumulated),
+                        )
                         if self._fallback_final_send:
                             await self._send_fallback_final(self._accumulated)
                         elif current_update_visible:
@@ -538,7 +842,17 @@ class GatewayStreamConsumer:
         last_message_id: Optional[str] = None
         last_successful_chunk = ""
         sent_any_chunk = False
-        for chunk in chunks:
+        for idx, chunk in enumerate(chunks):
+            if idx > 0:
+                await asyncio.sleep(
+                    compute_long_chunk_delay(
+                        chunk,
+                        base=self._long_chunk_delay_base,
+                        per_char=self._long_chunk_delay_per_char,
+                        max_delay=self._long_chunk_delay_max,
+                        jitter=self._delay_jitter,
+                    )
+                )
             # Try sending with one retry on flood-control errors.
             result = None
             for attempt in range(2):

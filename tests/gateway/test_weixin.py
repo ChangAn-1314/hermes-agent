@@ -362,6 +362,104 @@ class TestWeixinChunkDelivery:
         assert first_try["text"] == retry["text"]
         assert first_try["client_id"] == retry["client_id"]
 
+    def test_split_text_respects_utf8_byte_budget_for_cjk_content(self):
+        adapter = self._connected_adapter()
+        adapter.MAX_MESSAGE_LENGTH = 4000
+
+        content = "你" * 3912 + "\n\n第二段"
+        chunks = adapter._split_text(content)
+
+        assert len(chunks) >= 2
+        assert all(len(chunk.encode("utf-8")) <= adapter.MAX_MESSAGE_LENGTH for chunk in chunks)
+
+    @patch("gateway.platforms.weixin.asyncio.sleep", new_callable=AsyncMock)
+    @patch("gateway.platforms.weixin._send_message", new_callable=AsyncMock)
+    def test_send_clears_context_token_when_sendmessage_returns_ret_minus_2(self, send_message_mock, sleep_mock):
+        adapter = self._connected_adapter()
+        adapter._token_store = ContextTokenStore("/tmp")
+        adapter._token_store.get = lambda account_id, chat_id: "ctx-token"
+        adapter._token_store.set = lambda *args, **kwargs: None
+        cleared = []
+        adapter._token_store.clear = lambda account_id, chat_id: cleared.append((account_id, chat_id))
+
+        send_message_mock.side_effect = RuntimeError(
+            "iLink POST ilink/bot/sendmessage business error: ret=-2 errcode=0 errmsg="
+        )
+
+        result = asyncio.run(adapter.send("wxid_test123", "hello"))
+
+        assert result.success is False
+        assert cleared == [(adapter._account_id, "wxid_test123")]
+
+    @patch("gateway.platforms.weixin.asyncio.sleep", new_callable=AsyncMock)
+    @patch("gateway.platforms.weixin._send_message", new_callable=AsyncMock)
+    def test_send_retries_without_context_token_after_ret_minus_2(self, send_message_mock, sleep_mock):
+        adapter = self._connected_adapter()
+        state = {"token": "ctx-token"}
+
+        class _Store:
+            def get(self, account_id, chat_id):
+                return state["token"]
+            def clear(self, account_id, chat_id):
+                state["token"] = None
+
+        adapter._token_store = _Store()
+
+        async def side_effect(*args, **kwargs):
+            if kwargs.get("context_token") == "ctx-token":
+                raise RuntimeError("iLink POST ilink/bot/sendmessage business error: ret=-2 errcode=0 errmsg=")
+            return None
+
+        send_message_mock.side_effect = side_effect
+
+        result = asyncio.run(adapter.send("wxid_test123", "hello"))
+
+        assert result.success is True
+        assert send_message_mock.await_count == 2
+        assert send_message_mock.await_args_list[0].kwargs["context_token"] == "ctx-token"
+        assert send_message_mock.await_args_list[1].kwargs["context_token"] is None
+
+
+class TestWeixinApiPost:
+    class _FakeResponse:
+        def __init__(self, payload, ok=True, status=200):
+            self._payload = payload
+            self.ok = ok
+            self.status = status
+
+        async def text(self):
+            return json.dumps(self._payload, ensure_ascii=False)
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    class _FakeSession:
+        def __init__(self, payload):
+            self._payload = payload
+
+        def post(self, *args, **kwargs):
+            return TestWeixinApiPost._FakeResponse(self._payload)
+
+    def test_api_post_raises_on_business_error_even_with_http_200(self):
+        import pytest
+
+        session = self._FakeSession({"ret": 1, "errcode": 40013, "errmsg": "message too long"})
+
+        with pytest.raises(RuntimeError, match="ret=1 errcode=40013 errmsg=message too long"):
+            asyncio.run(
+                weixin._api_post(
+                    session,
+                    base_url="https://example.com",
+                    endpoint=weixin.EP_SEND_MESSAGE,
+                    payload={"msg": {"hello": "world"}},
+                    token="tok",
+                    timeout_ms=1000,
+                )
+            )
+
 
 class TestWeixinRemoteMediaSafety:
     def test_download_remote_media_blocks_unsafe_urls(self):

@@ -186,6 +186,42 @@ class TestApplySessionModelOverride:
 
         assert model == "anthropic/claude-sonnet-4"  # unchanged — wrong session key
 
+    def test_named_custom_provider_metadata_is_replayed(self):
+        """Named custom provider overrides must preserve source/requested_provider."""
+        runner = _make_runner()
+        sk = build_session_key(_make_source())
+
+        runner._session_model_overrides[sk] = {
+            "model": "gpt-5.4",
+            "provider": "custom",
+            "requested_provider": "custom:ikuncodegpt",
+            "source": "custom_provider:IkunCodeGPT",
+            "api_key": "sk-gpt",
+            "base_url": "https://api.ikuncode.cc/v1",
+            "api_mode": "chat_completions",
+        }
+
+        model, rt = runner._apply_session_model_override(
+            sk,
+            "anthropic/claude-sonnet-4",
+            {
+                "provider": "anthropic",
+                "requested_provider": "anthropic",
+                "source": "explicit",
+                "api_key": "ant-key",
+                "base_url": "https://api.anthropic.com",
+                "api_mode": "anthropic_messages",
+            },
+        )
+
+        assert model == "gpt-5.4"
+        assert rt["provider"] == "custom"
+        assert rt["requested_provider"] == "custom:ikuncodegpt"
+        assert rt["source"] == "custom_provider:IkunCodeGPT"
+        assert rt["api_key"] == "sk-gpt"
+        assert rt["base_url"] == "https://api.ikuncode.cc/v1"
+        assert rt["api_mode"] == "chat_completions"
+
 
 # ---------------------------------------------------------------------------
 # Tests: _is_intentional_model_switch
@@ -237,9 +273,36 @@ class TestIsIntentionalModelSwitch:
         runner._session_model_overrides["other_session"] = {
             "model": "gpt-5.4",
             "provider": "openai",
-            "api_key": "key",
+            "api_key": "***",
             "base_url": "",
             "api_mode": "chat_completions",
         }
 
         assert runner._is_intentional_model_switch(sk, "gpt-5.4") is False
+
+
+def test_resolve_session_agent_runtime_fast_path_preserves_named_custom_provider_metadata(monkeypatch):
+    """Fast-path session overrides must replay named custom provider identity."""
+    runner = _make_runner()
+    sk = build_session_key(_make_source())
+    runner._session_model_overrides[sk] = {
+        "model": "gpt-5.4",
+        "provider": "custom",
+        "requested_provider": "custom:ikuncodegpt",
+        "source": "custom_provider:IkunCodeGPT",
+        "api_key": "sk-gpt",
+        "base_url": "https://api.ikuncode.cc/v1",
+        "api_mode": "chat_completions",
+    }
+
+    monkeypatch.setattr("gateway.run._resolve_gateway_model", lambda _cfg=None: "anthropic/claude-sonnet-4")
+
+    model, runtime = runner._resolve_session_agent_runtime(session_key=sk, user_config={})
+
+    assert model == "gpt-5.4"
+    assert runtime["provider"] == "custom"
+    assert runtime["requested_provider"] == "custom:ikuncodegpt"
+    assert runtime["source"] == "custom_provider:IkunCodeGPT"
+    assert runtime["api_key"] == "sk-gpt"
+    assert runtime["base_url"] == "https://api.ikuncode.cc/v1"
+    assert runtime["api_mode"] == "chat_completions"
