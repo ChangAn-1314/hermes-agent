@@ -8362,7 +8362,11 @@ class AIAgent:
             opts = self._lmstudio_reasoning_options_cached()
             # "off-only" (or absent) means no real reasoning capability.
             return any(opt and opt != "off" for opt in opts)
-        if "openrouter" not in self._base_url_lower:
+        if (
+            "openrouter" not in self._base_url_lower
+            and "xcode.best" not in self._base_url_lower
+            and "api.ikuncode.cc" not in self._base_url_lower
+        ):
             return False
         if "api.mistral.ai" in self._base_url_lower:
             return False
@@ -8376,6 +8380,7 @@ class AIAgent:
             "google/gemini-2",
             "qwen/qwen3",
             "tencent/hy3-preview",
+            "gpt-5",
         )
         return any(model.startswith(prefix) for prefix in reasoning_model_prefixes)
 
