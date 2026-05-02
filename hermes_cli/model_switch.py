@@ -897,6 +897,21 @@ def switch_model(
                     ):
                         override = True
                         break
+        # Also check custom_providers: if the model is explicitly listed under
+        # the matched custom provider's `models:` dict, accept it regardless
+        # of what /v1/models returns.
+        if not override and custom_providers and target_provider.startswith("custom:"):
+            from hermes_cli.providers import custom_provider_slug
+            for cp in custom_providers:
+                if not isinstance(cp, dict):
+                    continue
+                if custom_provider_slug(cp.get("name", "")) == target_provider:
+                    cp_models = cp.get("models", {})
+                    if isinstance(cp_models, dict) and new_model in cp_models:
+                        override = True
+                    elif cp.get("model") == new_model:
+                        override = True
+                    break
         if override:
             validation = {"accepted": True, "persist": True, "recognized": False, "message": validation.get("message", "")}
         else:
