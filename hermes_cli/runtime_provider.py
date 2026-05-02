@@ -319,9 +319,10 @@ def _try_resolve_from_custom_pool(
     base_url: str,
     provider_label: str,
     api_mode_override: Optional[str] = None,
+    pool_key_override: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """Check if a credential pool exists for a custom endpoint and return a runtime dict if so."""
-    pool_key = get_custom_provider_pool_key(base_url)
+    pool_key = (pool_key_override or "").strip() or get_custom_provider_pool_key(base_url)
     if not pool_key:
         return None
     try:
@@ -488,7 +489,9 @@ def _resolve_named_custom_runtime(
     # Bare `provider="custom"` with an explicit base_url (e.g. propagated
     # from a `model_aliases:` direct-alias resolution) — build a runtime
     # directly so the alias's base_url actually takes effect.
-    requested_norm = (requested_provider or "").strip().lower()
+    requested_norm = _normalize_custom_provider_name(requested_provider or "")
+    bare_requested_name = (requested_provider or "").strip()
+    bare_requested_norm = _normalize_custom_provider_name(bare_requested_name)
     if requested_norm == "custom" and explicit_base_url:
         base_url = explicit_base_url.strip().rstrip("/")
         api_key_candidates = [
@@ -520,15 +523,28 @@ def _resolve_named_custom_runtime(
     if not base_url:
         return None
 
-    # Check if a credential pool exists for this custom endpoint
-    pool_result = _try_resolve_from_custom_pool(base_url, "custom", custom_provider.get("api_mode"))
+    # For named custom providers, only trust a credential pool when it is the
+    # matching provider's own pool. Falling back by bare base_url causes
+    # cross-wiring when multiple providers share one endpoint but use
+    # different keys/models (e.g. GPT vs Claude on the same aggregator).
+    requested_pool_key = requested_norm if requested_norm.startswith("custom:") else (
+        f"custom:{bare_requested_norm}" if bare_requested_norm and bare_requested_norm != "custom" else ""
+    )
+    pool_result = _try_resolve_from_custom_pool(
+        base_url,
+        "custom",
+        custom_provider.get("api_mode"),
+        requested_pool_key or None,
+    )
     if pool_result:
-        # Propagate the model name even when using pooled credentials —
-        # the pool doesn't know about the custom_providers model field.
-        model_name = custom_provider.get("model")
-        if model_name:
-            pool_result["model"] = model_name
-        return pool_result
+        resolved_source = str(pool_result.get("source") or "").strip().lower()
+        if not requested_pool_key or resolved_source == f"pool:{requested_pool_key}":
+            # Propagate the model name even when using pooled credentials —
+            # the pool doesn't know about the custom_providers model field.
+            model_name = custom_provider.get("model")
+            if model_name:
+                pool_result["model"] = model_name
+            return pool_result
 
     api_key_candidates = [
         (explicit_api_key or "").strip(),

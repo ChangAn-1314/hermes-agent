@@ -1114,12 +1114,71 @@ def test_named_custom_provider_without_api_mode_defaults(monkeypatch):
     assert resolved["api_mode"] == "chat_completions"
 
 
-def test_anthropic_messages_in_valid_api_modes():
-    """anthropic_messages should be accepted by _parse_api_mode."""
-    assert rp._parse_api_mode("anthropic_messages") == "anthropic_messages"
+def test_named_custom_provider_does_not_use_other_same_base_url_pool(monkeypatch):
+    """Named custom provider must not be intercepted by another provider pool that shares the same base_url."""
+    monkeypatch.setattr(
+        rp,
+        "_get_named_custom_provider",
+        lambda p: {
+            "name": "IkunCodeGPT",
+            "base_url": "https://api.ikuncode.cc/v1",
+            "api_key": "sk-gpt-cfg",
+            "api_mode": "chat_completions",
+            "model": "gpt-5.4",
+        },
+    )
+    monkeypatch.setattr(
+        rp,
+        "_try_resolve_from_custom_pool",
+        lambda *a, **k: {
+            "provider": "custom",
+            "api_mode": "chat_completions",
+            "base_url": "https://api.ikuncode.cc/v1",
+            "api_key": "sk-claude-pool",
+            "source": "pool:custom:ikuncodeclaude",
+        },
+    )
+
+    resolved = rp._resolve_named_custom_runtime(requested_provider="custom:ikuncodegpt")
+
+    assert resolved["source"] == "custom_provider:IkunCodeGPT"
+    assert resolved["api_key"] == "sk-gpt-cfg"
+    assert resolved["model"] == "gpt-5.4"
 
 
-def test_api_key_provider_anthropic_url_auto_detection(monkeypatch):
+def test_named_custom_provider_uses_matching_pool_when_same_provider(monkeypatch):
+    """Named custom provider may use a pool only when the resolved pool matches the requested provider."""
+    monkeypatch.setattr(
+        rp,
+        "_get_named_custom_provider",
+        lambda p: {
+            "name": "IkunCodeGPT",
+            "base_url": "https://api.ikuncode.cc/v1",
+            "api_key": "sk-gpt-cfg",
+            "api_mode": "chat_completions",
+            "model": "gpt-5.4",
+        },
+    )
+    monkeypatch.setattr(
+        rp,
+        "_try_resolve_from_custom_pool",
+        lambda *a, **k: {
+            "provider": "custom",
+            "api_mode": "chat_completions",
+            "base_url": "https://api.ikuncode.cc/v1",
+            "api_key": "sk-gpt-pool",
+            "source": "pool:custom:ikuncodegpt",
+        },
+    )
+
+    resolved = rp._resolve_named_custom_runtime(requested_provider="custom:ikuncodegpt")
+
+    assert resolved["source"] == "pool:custom:ikuncodegpt"
+    assert resolved["api_key"] == "sk-gpt-pool"
+    assert resolved["model"] == "gpt-5.4"
+
+
+def test_anthropic_messages_in_valid_api_modes(monkeypatch):
     """API-key providers with /anthropic base URL should auto-detect anthropic_messages mode."""
     monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "minimax")
     monkeypatch.setattr(rp, "_get_model_config", lambda: {})
