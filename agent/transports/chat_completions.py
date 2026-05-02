@@ -288,6 +288,22 @@ class ChatCompletionsTransport(ProviderTransport):
         elif anthropic_max_out is not None:
             api_kwargs["max_tokens"] = anthropic_max_out
 
+        # Xcode / IkunCode: top-level reasoning_effort (unless thinking disabled)
+        is_xcode = params.get("is_xcode", False)
+        if is_xcode:
+            _xcode_thinking_off = bool(
+                reasoning_config
+                and isinstance(reasoning_config, dict)
+                and reasoning_config.get("enabled") is False
+            )
+            if not _xcode_thinking_off:
+                _xcode_effort = "high"
+                if reasoning_config and isinstance(reasoning_config, dict):
+                    _e = (reasoning_config.get("effort") or "").strip().lower()
+                    if _e in ("low", "medium", "high", "xhigh"):
+                        _xcode_effort = "high" if _e == "xhigh" else _e
+                api_kwargs["reasoning_effort"] = _xcode_effort
+
         # Kimi: top-level reasoning_effort (unless thinking disabled)
         if is_kimi:
             _kimi_thinking_off = bool(

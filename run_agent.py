@@ -8417,6 +8417,10 @@ class AIAgent:
             is_github_models=_is_gh,
             is_nvidia_nim=_is_nvidia,
             is_kimi=_is_kimi,
+            is_xcode=(
+                "xcode.best" in self._base_url_lower
+                or "api.ikuncode.cc" in self._base_url_lower
+            ),
             is_tokenhub=_is_tokenhub,
             is_lmstudio=_is_lmstudio,
             is_custom_provider=self.provider == "custom",
